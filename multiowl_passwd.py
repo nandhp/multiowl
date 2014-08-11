@@ -8,6 +8,8 @@ if len(sys.argv) < 2:
     print "Usage: %s <username> [...]" % (sys.argv[0])
     sys.exit(1)
 
+import keyring
+print "Using", keyring.get_keyring()
 for username in sys.argv[1:]:
     prompt = "Password for %s: " % username
     password = getpass.getpass(prompt).strip()

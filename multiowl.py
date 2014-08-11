@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 
 """ multiowl.py - Mail checker for system notification area with enhanced
-                  support for multiple accounts.""" 
+                  support for multiple accounts."""
 
 import traceback
 import threading
 import gtk, gobject, cairo
 from StringIO import StringIO
 import time
-from collections import OrderedDict
+#from collections import OrderedDict
 from ConfigParser import RawConfigParser
 import os, os.path, sys
 import dbus, dbus.service, dbus.mainloop.glib
@@ -41,7 +41,7 @@ def _make_pixbuf(base, color, label):
     gdkctx.paint()
 
     # Measure text
-    my_str = unicode(label) 
+    my_str = unicode(label)
     cr.move_to(size, size)
     cr.select_font_face("sans", cairo.FONT_SLANT_NORMAL,
                         cairo.FONT_WEIGHT_NORMAL)
@@ -103,33 +103,26 @@ def _make_color(colorstr):
 class MailIcon(gtk.StatusIcon):
     INTERVAL = 3000
 
-    def __init__(self):
+    def __init__(self, app):
         super(MailIcon, self).__init__()
+        self.app = app
         self.connect('size-changed', self.resize_icon)
-        self.accounts = {}
-        self.accountnames = []
         self.nactive = 0
         self.displaying = None
         self.cycler = None
-        self.lock = threading.Lock()
+        self._lock = threading.Lock()
         self.base = None
+        self.pixbufcache = {}
+        self.updatetime = {}
+        gobject.timeout_add(60*1000, self.check_obsolete)
 
-    def add_account(self, account, name, color, index=None):
-        self.lock.acquire()
-        self.accounts[name] = [account, _make_color(color), 0, None]
-        if index is None:
-            index = len(self.accountnames)
-        self.accountnames.insert(index, name)
-        self.lock.release()
-        account.set_callback(self.update_happened)
-        self.update_happened()
+    def lock(self):
+        self._lock.acquire()
+        gtk.threads_enter()
 
-    def remove_account(self, name):
-        self.lock.acquire()
-        del self.accounts[name]
-        self.accountnames.remove(name)
-        self.lock.release()
-        self.update_happened()
+    def unlock(self):
+        gtk.threads_leave()
+        self._lock.release()
 
     def resize_icon(self, the_icon, size):
         print "Now %d pixels" % size
@@ -142,67 +135,66 @@ class MailIcon(gtk.StatusIcon):
         gobject.timeout_add(1, self.update_icon)
         return True
 
-    def update_pixbuf(self, account):
-        data = self.accounts[account]
-        self.accounts[account][3] = _make_pixbuf(self.base, data[1], data[2])
-
     def update_icon(self):
         if self.displaying:
-            data = self.accounts[self.displaying]
-            self.set_from_pixbuf(data[3])
+            self.set_from_pixbuf(self.pixbufcache[self.displaying])
             self.set_visible(True)
         else:
             self.set_visible(False)
 
     def cycle(self):
         # Determine the next account to display
-        keys = self.accountnames
+        keys = self.app.accountnames
         if self.displaying:
             pos = keys.index(self.displaying) + 1
         else:
             pos = 0
         permuted = keys[pos:] + keys[:pos]
         # Restrict the permuted list to active accounts
-        eligible = [x for x in permuted if self.accounts[x][2]]
+        eligible = [x for x in permuted if x in self.pixbufcache and
+                    self.pixbufcache[x]]
         if not eligible:
             # No active accounts
             self.displaying = None
         else:
             self.displaying = eligible[0]
-            self.update_icon()
+        self.update_icon()
         return True
 
     def auto_cycle(self):
-        self.lock.acquire()
-        gtk.threads_enter()
+        self.lock()
         self.cycle()
-        gtk.threads_leave()
-        self.lock.release()
+        self.unlock()
         return True
 
-    def update_happened(self):
-        self.lock.acquire()
-        gtk.threads_enter()
-
+    def update_happened(self, updated=None):
+        self.lock()
         # Determine how many active accounts we have for this icon
         new_active = 0
         new_tooltip = ['No new messages']
         new_total = 0
-        for name in self.accountnames:
-            data = self.accounts[name]
-            data[2] = data[0].count()
-            if data[2]:
+        current_active = False
+        for name in self.app.accountnames:
+            account = self.app.accounts[name]
+            count = account.count
+            if count:
+                self.pixbufcache[name] = _make_pixbuf(self.base,
+                                                      account.color,
+                                                      account.count)
+                new_tooltip.append('  %s in %s' % (count, name))
+                if type(count) is int:
+                    new_total += count
+                if self.displaying and name == self.displaying:
+                    current_active = True
                 new_active += 1
-                self.update_pixbuf(name)
-                new_tooltip.append('  %s in %s' % (data[2], name))
-                if type(data[2]) is int:
-                    new_total += data[2]
+            else:
+                self.pixbufcache[name] = None
 
         # Update the tooltip
         if new_total > 0:
             new_tooltip[0] = '<b>%d new messages</b>' % new_total
         self.set_tooltip_markup('\n'.join(new_tooltip))
-            
+
         # Do we need to be cycling between accounts?
         print "Have %d active accounts" % new_active
         if new_active > 1:
@@ -213,32 +205,79 @@ class MailIcon(gtk.StatusIcon):
             gobject.source_remove(self.cycler)
             self.cycler = None
 
-        # If the currently displayed account has no mail, cycle immediately 
-        if (self.displaying and self.accounts[self.displaying][2] <= 0) or \
+        # Monitor for dead threads
+        if updated:
+            if updated not in self.updatetime:
+                self.updatetime[updated] = [time.time(), 0]
+            else:
+                self.updatetime[updated][0] = time.time()
+                self.updatetime[updated][1] = 0
+
+        # If the currently displayed account has no mail, cycle immediately
+        if (self.displaying and not current_active) or \
             (not self.displaying and new_active > 0):
             self.cycle()
         else:
             self.update_icon()
 
-        gtk.threads_leave()
-        self.lock.release()
+        self.unlock()
 
-def _raise_NotImplementedError():
-    raise NotImplementedError
+    def check_obsolete(self):
+        now = time.time()
+        self.lock()
+        for name in self.app.accountnames:
+            if name not in self.updatetime:
+                self.updatetime[name] = [now, 0]
+            when, strikes = self.updatetime[name]
+            if now > when + 60*10: # FIXME: 2x interval
+                if strikes >= 1:
+                    sys.stderr.write("[%s] Respawning thread\n" % (name,))
+                    del self.updatetime[name]
+                    self.app.accounts[name].spawn_thread()
+                else:
+                    sys.stderr.write("[%s] Thread not responding\n" % (name,))
+                    self.updatetime[name][1] += 1
+        self.unlock()
+        return True
 
-class Account(threading.Thread):
+def _callback_warning():
+    print "Warning: callback for account not yet set."
+
+class Account(object):
     def __init__(self):
-        super(Account, self).__init__()
-        self.nmsgs = 0
-        self.callback = _raise_NotImplementedError
+        self._count = 0
+        self.callback = _callback_warning
         self.daemon = True
+        self.app = None
+        self.name = None
+        self.color = None
+        self._thread = None
 
-    def set_callback(self, callback):
+    def register(self, app, name, color, callback):
+        if self.app or self.name:
+            raise Exception
+        self.app = app
+        self.name = name
+        self.color = color
         self.callback = callback
+        self.spawn_thread()
 
+    def spawn_thread(self):
+        if self._thread:
+            self._thread.abort = True
+            sys.stderr.write('[%s] Aborting existing thread\n' % (self.name,))
+        self._thread = CheckerThread(self)
+        self._thread.start()
+
+    @property
     def count(self):
-        return self.nmsgs
+        return self._count
 
+    @count.setter
+    def count(self, value):
+        self._count = value
+        print "[%s] Got %s messages" % (self.name, self._count)
+        self.callback(self.name)
 
 class AccountIMAP(Account):
     def __init__(self, hostname, username, mailbox='INBOX', port=993):
@@ -251,86 +290,87 @@ class AccountIMAP(Account):
         self.mailbox = mailbox
         # FIXME: maintain connection to IMAP server and/or use IDLE
 
-        self.start()
-
-    def run(self):
-        while True:
-            try:
-                # FIXME: verify certificate
-                password = get_password('%s@%s' % (self.username,
-                                                   self.hostname))
-                imap = imaplib.IMAP4_SSL(self.hostname, self.port)
-                imap.login(self.username, password)
-                results = imap.status(self.mailbox, '(UNSEEN)')
-                result = results[1][0].split('(')[1].split(')')[0].split(' ')
-                self.nmsgs = int(result[1])
+    def _check(self):
+        # FIXME: verify certificate
+        password = self.app.passwords['%s@%s' % (self.username,
+                                                 self.hostname)]
+        try:
+            imap = imaplib.IMAP4_SSL(self.hostname, self.port)
+            imap.login(self.username, password)
+            results = imap.status(self.mailbox, '(UNSEEN)')
+            result = results[1][0].split('(')[1].split(')')[0].split(' ')
+            return int(result[1])
+        finally:
+            if imap:
                 imap.logout()
-            except Exception:
-                print 'AccountIMAP: %s@%s: Exception.' % \
-                    (self.username, self.hostname)
-                traceback.print_exc()
-                self.nmsgs = '?'
 
-            print "[%s@%s] Got %s messages" % \
-                (self.username, self.hostname,self.nmsgs)
-            self.callback()
-            time.sleep(300)
-        
 class AccountGmail(Account):
     class MyPasswordMgr(object):
-        def __init__(self, realm, uri, user):
+        def __init__(self, account):
+            self.account = account
+            self.realm = None
+            self.uri = None
+            self.user = None
+            self.password = None
+        def add_password(self, realm, uri, user, passwd):
             self.realm = realm
             self.uri = uri
             self.user = user
-        def add_password(self, realm, uri, user, passwd):
-            raise NotImplemented
+            self.password = passwd
         def find_user_password(self, realm, authuri):
             if realm == self.realm and authuri == self.uri:
-                return (self.user, get_password(self.user))
+                return (self.user, self.password)
             else:
                 return (None, None)
 
     def __init__(self, username):
         super(AccountGmail, self).__init__()
 
-        # For error reporting 
         self.username = username
-
-        self.url = 'https://mail.google.com/mail/feed/atom'
-        password_mgr = self.MyPasswordMgr(realm='New mail feed',
-                                          uri=self.url,
-                                          user=username)
-        auth_handler = urllib2.HTTPBasicAuthHandler(password_mgr)
+        self.password_mgr = self.MyPasswordMgr(self)
+        auth_handler = urllib2.HTTPBasicAuthHandler(self.password_mgr)
         https_handler = VerifiedHTTPSHandler()
         self.url_opener = urllib2.build_opener(auth_handler, https_handler)
-
         # FIXME: Also support XMPP
 
-        self.start()
-
-    def run(self):
-        # Fetch/monitor unread count
-        while True:
-            handle = None
-            try:
-                handle = self.url_opener.open(self.url)
-                dom = minidom.parse(handle)
-                fullcount = dom.getElementsByTagName('fullcount')[0]
-                self.nmsgs = int(fullcount.firstChild.data)
-            except Exception:
-                print 'AccountGmail: %s: Exception.' % self.username
-                traceback.print_exc()
-                self.nmsgs = '?'
+    def _check(self):
+        handle = None
+        url = 'https://mail.google.com/mail/feed/atom'
+        self.password_mgr.add_password('New mail feed', url, self.username,
+                                       self.app.passwords[self.username])
+        try:
+            handle = self.url_opener.open(url)
+            dom = minidom.parse(handle)
+            fullcount = dom.getElementsByTagName('fullcount')[0]
+            return int(fullcount.firstChild.data)
+        finally:
             if handle:
                 handle.close()
 
-            print "[%s] Got %s messages" % (self.username, self.nmsgs)
-            self.callback()
+class CheckerThread(threading.Thread):
+    def __init__(self, account):
+        super(CheckerThread, self).__init__()
+        self.account = account
+        self.abort = False
+
+    def run(self):
+        # Fetch/monitor unread count
+        while not self.abort:
+            try:
+                count = self.account._check()
+            except Exception:
+                sys.stderr.write('[%s] Exception\n' % (self.account.name,))
+                traceback.print_exc()
+                count = '?'
+            if self.abort:
+                break
+            self.account.count = count
 
             try:
                 time.sleep(300)
             except KeyboardInterrupt:
                 return
+        sys.stderr.write('[%s] Thread exiting' % (self.account.name,))
 
 # From
 # http://thejosephturner.com/blog/2011/03/19/
@@ -363,53 +403,37 @@ class VerifiedHTTPSHandler(urllib2.HTTPSHandler):
     def https_open(self, req):
         return self.do_open(self.specialized_conn_class, req)
 
-passwords = {}                  # FIXME
-def get_password(username):
-    if username in passwords:
-        return passwords[username]
-    return None
-def load_password(username):
-    import keyring              # Must be imported after dbus
-    passwords[username] = keyring.get_password(KEYRING_SERVICE, username)
-    if not passwords[username]:
-        sys.stderr.write("No password for %s.\n" % username)
-def store_password(username, password):
-    import keyring              # Must be imported after dbus
-    if password is None:
-        keyring.delete_password(KEYRING_SERVICE, username)
-    else:
-        keyring.set_password(KEYRING_SERVICE, username, password)
+class PasswordManager(object):
+    def __init__(self):
+        self.passwords = {}
 
-def add_accounts(icon, settings):
-    if not icon.base:
-        # Wait for icon to become ready
-        return True
+    def __getitem__(self, username):
+        if username in self.passwords:
+            return self.passwords[username]
+        return None
 
-    # FIXME: Use keyring (or gnomekeyring)
-    # https://bitbucket.org/kang/python-keyring-lib/src/8aeb01ec6b36bc92bfde504482c00297c42bb792/keyring/backends/Gnome.py?at=default
-    # https://bitbucket.org/kang/python-keyring-lib
-    for name in settings.sections():
-        account_type = settings.get(name, 'type')
-        #account_class = globals()['Account'+account_type] # FIXME 
-        color = settings.get(name, 'color')
-        if account_type == 'Gmail':
-            username = settings.get(name, 'username')
-            load_password(username)
-            account = AccountGmail(username)
-        elif account_type == 'IMAP':
-            server = settings.get(name, 'server')
-            username = settings.get(name, 'username')
-            load_password('%s@%s' % (username, server))
-            account = AccountIMAP(server, username)
-        icon.add_account(account, name, color)
+    def load(self, username):
+        import keyring          # Must be imported after dbus
+        password = keyring.get_password(KEYRING_SERVICE,
+                                                        username)
+        if not password:
+            sys.stderr.write("No password for %s.\n" % username)
+        self.passwords[username] = password
 
-    return False
+    def store(self, username, password):
+        import keyring              # Must be imported after dbus
+        if password is None:
+            keyring.delete_password(KEYRING_SERVICE, username)
+            del self.passwords[username]
+        else:
+            keyring.set_password(KEYRING_SERVICE, username, password)
+            self.passwords[username] = password
 
 class MultiowlConfigurator(gtk.Dialog):
-    def __init__(self, settings):
+    def __init__(self, app):
         super(MultiowlConfigurator, self).__init__('Multiowl Preferences', \
             buttons=(gtk.STOCK_CLOSE, gtk.RESPONSE_ACCEPT))
-        self.connect('response', self.dismiss) 
+        self.connect('response', self.dismiss)
 
     def show(self):
         self.show_all()
@@ -421,39 +445,92 @@ class MultiowlConfigurator(gtk.Dialog):
 DBUS_NAME = 'nandhp.multiowl'
 DBUS_PATH = '/nandhp/multiowl'
 class DBusService(dbus.service.Object):
-    def __init__(self, configurator):
+    def __init__(self, app):
         name = dbus.service.BusName(DBUS_NAME, bus=dbus.SessionBus())
         dbus.service.Object.__init__(self, name, DBUS_PATH)
-        self.configurator = configurator
+        self.app = app
 
     @dbus.service.method(dbus_interface=DBUS_NAME)
     def test(self):
         print "Alerted!"
-        
+
     @dbus.service.method(dbus_interface=DBUS_NAME)
     def preferences(self):
-        self.configurator.show()
+        self.app.configurator.show()
 
-def main():
-    # Read configuration
-    settings = RawConfigParser()
-    settings.read(CONFIG_FILE)
-    # Check single-instance
-    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-    if dbus.SessionBus().request_name(DBUS_NAME) != \
-            dbus.bus.REQUEST_NAME_REPLY_PRIMARY_OWNER:
-        print "Sending message to existing instance"
-        instance = dbus.SessionBus().get_object(DBUS_NAME, DBUS_PATH)
-        trigger = instance.get_dbus_method('preferences')
-        trigger()
-        return
-    # Configurator
-    configurator = MultiowlConfigurator(settings)
-    service = DBusService(configurator)
-    # Create icon(s)
-    icon = MailIcon()
-    gobject.timeout_add(1, add_accounts, icon, settings)
-    gtk.main()
+class MultiowlApp(object):
+    def __init__(self):
+        # Check single-instance
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+        if dbus.SessionBus().request_name(DBUS_NAME) != \
+           dbus.bus.REQUEST_NAME_REPLY_PRIMARY_OWNER:
+            print "Sending message to existing instance"
+            instance = dbus.SessionBus().get_object(DBUS_NAME, DBUS_PATH)
+            trigger = instance.get_dbus_method('preferences')
+            trigger()
+            return
+        self.service = DBusService(self)
+
+        # Create icon(s)
+        self.icon = MailIcon(self)
+
+        # Accounts
+        self.passwords = PasswordManager()
+        self.accounts = {}
+        self.accountnames = []
+
+        # Read configuration
+        self.settings = RawConfigParser()
+        self.settings.read(CONFIG_FILE)
+        self.configurator = MultiowlConfigurator(self)
+        self.add_accounts()
+
+        self.main()
+
+    def add_account(self, name, account, color, index=None):
+        self.icon.lock()
+        self.accounts[name] = account
+        if index is None:
+            index = len(self.accountnames)
+        self.accountnames.insert(index, name)
+        color = _make_color(color) # Do this with the GTK lock
+        self.icon.unlock()
+        account.register(self, name, color, callback=self.icon.update_happened)
+        self.icon.update_happened()
+
+    def remove_account(self, name):
+        self.icon.lock()
+        del self.accounts[name]
+        self.accountnames.remove(name)
+        self.icon.unlock()
+        self.icon.update_happened()
+
+    def add_accounts(self):
+        if not self.icon.base:
+            # Wait for icon to become ready
+            gobject.timeout_add(1, self.add_accounts)
+            return False
+
+        for name in self.settings.sections():
+            account_type = self.settings.get(name, 'type')
+            #account_class = globals()['Account'+account_type] # FIXME
+            color = self.settings.get(name, 'color')
+            if account_type == 'Gmail':
+                username = self.settings.get(name, 'username')
+                self.passwords.load(username)
+                account = AccountGmail(username)
+            elif account_type == 'IMAP':
+                server = self.settings.get(name, 'server')
+                username = self.settings.get(name, 'username')
+                self.passwords.load('%s@%s' % (username, server))
+                account = AccountIMAP(server, username)
+            self.add_account(name, account, color)
+
+        return False
+
+    @staticmethod
+    def main():
+        gtk.main()
 
 if __name__ == '__main__':
-    main()
+    MultiowlApp()
