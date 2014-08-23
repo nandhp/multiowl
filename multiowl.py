@@ -236,6 +236,7 @@ class MailIcon(gtk.StatusIcon):
                     self.app.accounts[name].spawn_thread()
                 else:
                     sys.stderr.write("[%s] Thread not responding\n" % (name,))
+                    self.updatetime[name][0] = now
                     self.updatetime[name][1] += 1
         self.unlock()
         return True
@@ -353,6 +354,9 @@ class CheckerThread(threading.Thread):
         self.account = account
         self.abort = False
 
+        self.daemon = True      # Exit with main thread
+        # self.start()
+
     def run(self):
         # Fetch/monitor unread count
         while not self.abort:
@@ -370,7 +374,7 @@ class CheckerThread(threading.Thread):
                 time.sleep(300)
             except KeyboardInterrupt:
                 return
-        sys.stderr.write('[%s] Thread exiting' % (self.account.name,))
+        sys.stderr.write('[%s] Thread exiting\n' % (self.account.name,))
 
 # From
 # http://thejosephturner.com/blog/2011/03/19/
@@ -414,14 +418,13 @@ class PasswordManager(object):
 
     def load(self, username):
         import keyring          # Must be imported after dbus
-        password = keyring.get_password(KEYRING_SERVICE,
-                                                        username)
+        password = keyring.get_password(KEYRING_SERVICE, username)
         if not password:
-            sys.stderr.write("No password for %s.\n" % username)
+            sys.stderr.write("No password for %s.\n" % (username,))
         self.passwords[username] = password
 
     def store(self, username, password):
-        import keyring              # Must be imported after dbus
+        import keyring          # Must be imported after dbus
         if password is None:
             keyring.delete_password(KEYRING_SERVICE, username)
             del self.passwords[username]
