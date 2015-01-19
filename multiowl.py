@@ -533,7 +533,9 @@ class MultiowlApp(object):
 
     @staticmethod
     def main():
+        gtk.threads_enter()     # FIXME: Rewrite in Qt
         gtk.main()
+        gtk.threads_leave()
 
 if __name__ == '__main__':
     MultiowlApp()

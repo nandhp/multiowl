@@ -18,4 +18,4 @@ for username in sys.argv[1:]:
         password = None
     else:
         print "Storing new password for %s" % username
-    multiowl.store_password(username, password)
+    multiowl.PasswordManager().store(username, password)
