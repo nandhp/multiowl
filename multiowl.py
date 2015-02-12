@@ -295,6 +295,7 @@ class AccountIMAP(Account):
         # FIXME: verify certificate
         password = self.app.passwords['%s@%s' % (self.username,
                                                  self.hostname)]
+        imap = None
         try:
             imap = imaplib.IMAP4_SSL(self.hostname, self.port)
             imap.login(self.username, password)
@@ -309,17 +310,15 @@ class AccountGmail(Account):
     class MyPasswordMgr(object):
         def __init__(self, account):
             self.account = account
-            self.realm = None
             self.uri = None
             self.user = None
             self.password = None
         def add_password(self, realm, uri, user, passwd):
-            self.realm = realm
             self.uri = uri
             self.user = user
             self.password = passwd
         def find_user_password(self, realm, authuri):
-            if realm == self.realm and authuri == self.uri:
+            if authuri == self.uri:
                 return (self.user, self.password)
             else:
                 return (None, None)
@@ -337,7 +336,8 @@ class AccountGmail(Account):
     def _check(self):
         handle = None
         url = 'https://mail.google.com/mail/feed/atom'
-        self.password_mgr.add_password('New mail feed', url, self.username,
+        self.password_mgr.add_password(['New mail feed', 'mail.google.com'],
+                                       url, self.username,
                                        self.app.passwords[self.username])
         try:
             handle = self.url_opener.open(url)
