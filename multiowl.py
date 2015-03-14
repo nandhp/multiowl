@@ -3,14 +3,16 @@
 """ multiowl.py - Mail checker for system notification area with enhanced
                   support for multiple accounts."""
 
-import traceback
 import threading
-import gtk, gobject, cairo
-from StringIO import StringIO
 import time
+import logging
 #from collections import OrderedDict
 from ConfigParser import RawConfigParser
-import os, os.path, sys
+import os
+
+# For icon (GTK+ version)
+import gtk, gobject, cairo
+from StringIO import StringIO
 import dbus, dbus.service, dbus.mainloop.glib
 
 # For Gmail
@@ -19,6 +21,8 @@ from xml.dom import minidom
 
 # For IMAP
 import imaplib
+from contextlib import contextmanager
+import select
 
 DATA_DIR = os.path.dirname(os.path.realpath(__file__))
 os.chdir(DATA_DIR)
@@ -26,10 +30,12 @@ os.chdir(DATA_DIR)
 gtk.threads_init()
 
 _CONFIG_DIR = os.environ.get('XDG_CONFIG_HOME',
-    os.path.join(os.path.expanduser('~'), '.config'))
+                             os.path.join(os.path.expanduser('~'), '.config'))
 CONFIG_FILE = os.path.join(_CONFIG_DIR, 'multiowl', 'config')
 
 KEYRING_SERVICE = 'multiowl'
+
+CHECK_INTERVAL = 300
 
 def _make_pixbuf(base, color, label):
     # Convert the base image to a Cairo surface
@@ -43,7 +49,7 @@ def _make_pixbuf(base, color, label):
     # Measure text
     my_str = unicode(label)
     cr.move_to(size, size)
-    cr.select_font_face("sans", cairo.FONT_SLANT_NORMAL,
+    cr.select_font_face('sans', cairo.FONT_SLANT_NORMAL,
                         cairo.FONT_WEIGHT_NORMAL)
     cr.set_font_size(10.0*size/22)
     extents = cr.text_extents(my_str) # x_bearing,y_bearing, width,height, ...
@@ -105,6 +111,7 @@ class MailIcon(gtk.StatusIcon):
 
     def __init__(self, app):
         super(MailIcon, self).__init__()
+        self.log = logging.getLogger('icon')
         self.app = app
         self.connect('size-changed', self.resize_icon)
         self.nactive = 0
@@ -125,9 +132,9 @@ class MailIcon(gtk.StatusIcon):
         self._lock.release()
 
     def resize_icon(self, the_icon, size):
-        print "Now %d pixels" % size
+        self.log.debug("Now %d pixels" % size)
         self.base = gtk.gdk.pixbuf_new_from_file_at_size('mail.svg',
-            size, size)
+                                                         size, size)
         #self.base = gtk.gdk.pixbuf_new_from_icon_name('mail-unread')
         self.set_from_pixbuf(self.base)
         # Wait for icon to realize, else bad things happen (the Cairo text
@@ -171,7 +178,7 @@ class MailIcon(gtk.StatusIcon):
         self.lock()
         # Determine how many active accounts we have for this icon
         new_active = 0
-        new_tooltip = ['No new messages']
+        new_tooltip = ["No new messages"]
         new_total = 0
         current_active = False
         for name in self.app.accountnames:
@@ -181,7 +188,7 @@ class MailIcon(gtk.StatusIcon):
                 self.pixbufcache[name] = _make_pixbuf(self.base,
                                                       account.color,
                                                       account.count)
-                new_tooltip.append('  %s in %s' % (count, name))
+                new_tooltip.append("  %s in %s" % (count, name))
                 if type(count) is int:
                     new_total += count
                 if self.displaying and name == self.displaying:
@@ -192,11 +199,11 @@ class MailIcon(gtk.StatusIcon):
 
         # Update the tooltip
         if new_total > 0:
-            new_tooltip[0] = '<b>%d new messages</b>' % new_total
+            new_tooltip[0] = "<b>%d new messages</b>" % new_total
         self.set_tooltip_markup('\n'.join(new_tooltip))
 
         # Do we need to be cycling between accounts?
-        print "Have %d active accounts" % new_active
+        self.log.info("%d active accounts" % new_active)
         if new_active > 1:
             if not self.cycler:
                 self.cycler = gobject.timeout_add(self.INTERVAL, \
@@ -229,25 +236,24 @@ class MailIcon(gtk.StatusIcon):
             if name not in self.updatetime:
                 self.updatetime[name] = [now, 0]
             when, strikes = self.updatetime[name]
-            if now > when + 60*10: # FIXME: 2x interval
+            if now > when + CHECK_INTERVAL*3/2:
+                # FIXME: use Network Manager
                 if strikes >= 1:
-                    sys.stderr.write("[%s] Respawning thread\n" % (name,))
+                    self.app.accounts[name].log.warning("Respawning thread")
                     del self.updatetime[name]
                     self.app.accounts[name].spawn_thread()
                 else:
-                    sys.stderr.write("[%s] Thread not responding\n" % (name,))
+                    self.app.accounts[name].log.warning("Thread not responding")
                     self.updatetime[name][0] = now
                     self.updatetime[name][1] += 1
         self.unlock()
         return True
 
-def _callback_warning():
-    print "Warning: callback for account not yet set."
-
 class Account(object):
     def __init__(self):
-        self._count = 0
-        self.callback = _callback_warning
+        self._count = '?'
+        self.log = logging.getLogger("(unknown account)")
+        self.callback = self._callback_warning
         self.daemon = True
         self.app = None
         self.name = None
@@ -261,12 +267,13 @@ class Account(object):
         self.name = name
         self.color = color
         self.callback = callback
+        self.log = logging.getLogger(self.name)
         self.spawn_thread()
 
     def spawn_thread(self):
         if self._thread:
             self._thread.abort = True
-            sys.stderr.write('[%s] Aborting existing thread\n' % (self.name,))
+            self.log.warning("Aborting existing thread")
         self._thread = CheckerThread(self)
         self._thread.start()
 
@@ -277,8 +284,16 @@ class Account(object):
     @count.setter
     def count(self, value):
         self._count = value
-        print "[%s] Got %s messages" % (self.name, self._count)
+        self.log.info("Got %s messages" % (self._count,))
         self.callback(self.name)
+
+    def watch(self):
+        while True:
+            yield self.check()
+            time.sleep(CHECK_INTERVAL)
+
+    def _callback_warning(self):
+        self.log.warning("Account callback not yet set")
 
 class AccountIMAP(Account):
     def __init__(self, hostname, username, mailbox='INBOX', port=993):
@@ -289,24 +304,100 @@ class AccountIMAP(Account):
         self.port = port
         self.username = username
         self.mailbox = mailbox
-        # FIXME: maintain connection to IMAP server and/or use IDLE
 
-    def _check(self):
-        # FIXME: verify certificate
-        password = self.app.passwords['%s@%s' % (self.username,
-                                                 self.hostname)]
-        imap = None
+        # Persistent IMAP connection
+        self._imap = None
+        self._refcount = 0
+
+    def _get_password(self):
+        return self.app.passwords['%s@%s' % (self.username, self.hostname)]
+
+    @contextmanager
+    def _connect(self):
+        if not self._imap:
+            try:
+                self._imap = IMAP4_VerifiedSSL(self.hostname, self.port)
+                self._imap.login(self.username, self._get_password())
+                self._imap.select(self.mailbox, True)
+                #print "IMAP Connected"
+            except Exception:
+                if self._imap:
+                    self._imap.logout()
+                #print "IMAP Failed"
+                self._imap = None
+                raise
+        # Return reference to IMAP object
+        self._refcount += 1     # FIXME: thread-safe?
         try:
-            imap = imaplib.IMAP4_SSL(self.hostname, self.port)
-            imap.login(self.username, password)
-            results = imap.status(self.mailbox, '(UNSEEN)')
-            result = results[1][0].split('(')[1].split(')')[0].split(' ')
-            return int(result[1])
+            yield self._imap
         finally:
-            if imap:
-                imap.logout()
+            self._refcount -= 1
+            # Log out of the IMAP server
+            assert self._refcount >= 0
+            if self._refcount == 0 and self._imap:
+                self._imap.logout()
+                self._imap = None
+                #print "IMAP Disconnected"
 
-class AccountGmail(Account):
+    def _idle(self, imap, timeout=29*60):
+        # Wait for something to happen
+        #
+        # See: http://stackoverflow.com/questions/18103278/
+        # See also: http://bugs.python.org/file27400/imapidle.patch
+        tag = imap._new_tag()
+        try:
+            imap.send('%s IDLE%s' % (tag, imaplib.CRLF))
+            sock = imap.socket()
+            deadline = time.time() + timeout
+            while True:
+                timeleft = deadline - time.time()
+                if timeleft <= 0:
+                    break
+                #print "Waiting on IDLE (%d sec left)" % (timeleft,)
+                ready = select.select((sock,), (), (sock,), timeleft)
+                if sock not in ready[0]:
+                    break
+                # Something happened
+                resp = imap.readline().strip()
+                #print "Got %s from IMAP" % (resp,)
+                if not resp or resp[0] == '*':
+                    if resp:
+                        command = resp[1:].strip().split(None, 1)[0].upper()
+                        if command in ('OK',):
+                            continue
+                        # Handle '* 661 FETCH (FLAGS (\Flagged \Seen))'
+                        # Handle '* 664 EXISTS'
+                        # Handle '* 664 EXPUNGE'
+                        # (but will need to track all messages in mailbox)
+                    break
+                elif resp[0] != '+':
+                    raise Exception("Unexpected IMAP IDLE response: %s" %
+                                    (resp,))
+        finally:
+            imap.send('DONE%s' % (imaplib.CRLF))
+            imap._get_response()
+
+    def watch(self):
+        # Reuse a single connection to the server
+        with self._connect() as imap:
+            while True:
+                yield self.check()
+                if 'IDLE' in imap.capabilities:
+                    self._idle(imap, timeout=CHECK_INTERVAL) # or 29 minutes
+                else:
+                    time.sleep(CHECK_INTERVAL)
+
+    def check(self):
+        with self._connect() as imap:
+            #results = imap.status(self.mailbox, '(UNSEEN)')
+            #result = results[1][0].split('(')[1].split(')')[0].split(' ')
+            #result = int(result[1])
+            typ, msgnums = imap.search(None, '(UNSEEN)')
+            assert typ == 'OK'
+            result = len(msgnums[0].split())
+        return result
+
+class AccountGmailAtom(Account):
     class MyPasswordMgr(object):
         def __init__(self, account):
             self.account = account
@@ -324,7 +415,7 @@ class AccountGmail(Account):
                 return (None, None)
 
     def __init__(self, username):
-        super(AccountGmail, self).__init__()
+        super(AccountGmailAtom, self).__init__()
 
         self.username = username
         self.password_mgr = self.MyPasswordMgr(self)
@@ -333,7 +424,7 @@ class AccountGmail(Account):
         self.url_opener = urllib2.build_opener(auth_handler, https_handler)
         # FIXME: Also support XMPP
 
-    def _check(self):
+    def check(self):
         handle = None
         url = 'https://mail.google.com/mail/feed/atom'
         self.password_mgr.add_password(['New mail feed', 'mail.google.com'],
@@ -348,6 +439,15 @@ class AccountGmail(Account):
             if handle:
                 handle.close()
 
+class AccountGmailImap(AccountIMAP):
+    def __init__(self, username):
+        super(AccountGmailImap, self).__init__('imap.googlemail.com', username)
+
+    def _get_password(self):
+        return self.app.passwords[self.username]
+
+AccountGmail = AccountGmailImap
+
 class CheckerThread(threading.Thread):
     def __init__(self, account):
         super(CheckerThread, self).__init__()
@@ -360,21 +460,58 @@ class CheckerThread(threading.Thread):
     def run(self):
         # Fetch/monitor unread count
         while not self.abort:
+            minwatch = time.time() + CHECK_INTERVAL
             try:
-                count = self.account._check()
-            except Exception:
-                sys.stderr.write('[%s] Exception\n' % (self.account.name,))
-                traceback.print_exc()
-                count = '?'
-            if self.abort:
-                break
-            self.account.count = count
-
-            try:
-                time.sleep(300)
+                watcher = self.account.watch()
+                for count in watcher:
+                    if self.abort:
+                        break
+                    self.account.count = count
             except KeyboardInterrupt:
-                return
-        sys.stderr.write('[%s] Thread exiting\n' % (self.account.name,))
+                break
+            except Exception:
+                self.account.log.exception("Got an exception")
+                self.account.count = '?'
+            try:
+                diffwatch = minwatch - time.time()
+                if diffwatch > 0:
+                    self.account.log.info("Waiting %d sec before retrying" %
+                                          (diffwatch,))
+                    time.sleep(diffwatch)
+            except KeyboardInterrupt:
+                break
+        self.account.log.warning("Thread exiting")
+
+
+# A wrap_socket implementation that verifies certificates using system
+# CA certificates
+def my_wrap_socket(sock, keyfile=None, certfile=None,
+                   do_handshake_on_connect=True,
+                   suppress_ragged_eofs=True,
+                   server_hostname=None):
+    sslctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    if keyfile or certfile:
+        sslctx.load_cert_chain(certfile, keyfile)
+    sslctx.verify_mode = ssl.CERT_REQUIRED # Should be default
+    return sslctx.wrap_socket(sock, server_side=False,
+                              do_handshake_on_connect=do_handshake_on_connect,
+                              suppress_ragged_eofs=suppress_ragged_eofs,
+                              server_hostname=server_hostname)
+
+# An IMAP4_SSL implementation that uses my_wrap_socket to verify certificates
+class IMAP4_VerifiedSSL(imaplib.IMAP4_SSL):
+    def open(self, host='', port=imaplib.IMAP4_SSL_PORT):
+        """Setup connection to remote server on "host:port".
+            (default: localhost:standard IMAP4 SSL port).
+        This connection will be used by the routines:
+            read, readline, send, shutdown.
+        """
+        self.host = host
+        self.port = port
+        self.sock = socket.create_connection((host, port))
+        self.sslobj = my_wrap_socket(self.sock, self.keyfile, self.certfile,
+                                     server_hostname=host)
+        self.file = self.sslobj.makefile('rb')
 
 # From
 # http://thejosephturner.com/blog/2011/03/19/
@@ -391,17 +528,11 @@ class VerifiedHTTPSConnection(httplib.HTTPSConnection):
         #    certs in trusted_root_certs
         #ca = ssl.get_server_certificate((host, port),
         #    ssl_version=ssl.PROTOCOL_SSLv3|ssl.PROTOCOL_TLSv1)
-
-        self.sock = ssl.wrap_socket(sock,
-                                    self.key_file,
-                                    self.cert_file,
-                                    cert_reqs=ssl.CERT_REQUIRED,
-                                    # FIXME: bad practice
-                                    ca_certs="Equifax.pem")
+        self.sock = my_wrap_socket(sock, server_hostname=self.host)
 
 # wraps https connections with ssl certificate verification
 class VerifiedHTTPSHandler(urllib2.HTTPSHandler):
-    def __init__(self, connection_class = VerifiedHTTPSConnection):
+    def __init__(self, connection_class=VerifiedHTTPSConnection):
         self.specialized_conn_class = connection_class
         urllib2.HTTPSHandler.__init__(self)
     def https_open(self, req):
@@ -410,6 +541,7 @@ class VerifiedHTTPSHandler(urllib2.HTTPSHandler):
 class PasswordManager(object):
     def __init__(self):
         self.passwords = {}
+        self.log = logging.getLogger(self.__class__.__name__)
 
     def __getitem__(self, username):
         if username in self.passwords:
@@ -420,7 +552,7 @@ class PasswordManager(object):
         import keyring          # Must be imported after dbus
         password = keyring.get_password(KEYRING_SERVICE, username)
         if not password:
-            sys.stderr.write("No password for %s.\n" % (username,))
+            self.log.warning("No password for %s" % (username,))
         self.passwords[username] = password
 
     def store(self, username, password):
@@ -434,7 +566,7 @@ class PasswordManager(object):
 
 class MultiowlConfigurator(gtk.Dialog):
     def __init__(self, app):
-        super(MultiowlConfigurator, self).__init__('Multiowl Preferences', \
+        super(MultiowlConfigurator, self).__init__("Multiowl Preferences", \
             buttons=(gtk.STOCK_CLOSE, gtk.RESPONSE_ACCEPT))
         self.connect('response', self.dismiss)
 
@@ -538,4 +670,7 @@ class MultiowlApp(object):
         gtk.threads_leave()
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.DEBUG,
+                        datefmt='%Y-%m-%d %H:%M:%S',
+                        format="[%(asctime)s] <%(name)s> %(message)s")
     MultiowlApp()
