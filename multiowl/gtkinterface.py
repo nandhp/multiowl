@@ -100,7 +100,10 @@ class MailIconGtk(MailIconBase):
         self._account_data_class = AccountIconDataGtk
 
         self.icon = gtk.StatusIcon()
-        self.icon.set_title("MultiOwl")
+        try:
+            self.icon.set_title("MultiOwl")
+        except AttributeError:
+            pass
         #self._resize_icon(self.icon, 1)
         self.icon.connect('size-changed', self._resize_icon)
 
